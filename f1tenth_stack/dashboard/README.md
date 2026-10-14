@@ -61,11 +61,14 @@ For example `ros2 launch f1tenth_stack bringup_launch.py use_camera:=false`. Wit
 
 ### Setting up another car
 
+Most of this is probably already done on the cars; each step says how to check before changing anything.
+
 1. `git pull` and `git submodule update --init --recursive` in `~/f1tenth_ws/src/f1tenth_system`, then `colcon build --packages-select f1tenth_stack` and restart bringup.
 2. rosbridge and GStreamer installed. Usually nothing to do: GStreamer comes with the Jetson's Ubuntu image, and rosbridge is already on robots #2 and #6. If either is missing, run `rosdep install --from-paths src --ignore-src -r -y` in `~/f1tenth_ws`; it installs both, since they are declared in `package.xml`. On a brand-new car, the `wsu-roboracer/robot-commissioning` setup script runs that for you.
-3. The login user in the `input` group, or ROS cannot read the controller: `sudo usermod -aG input $USER`, then log out and back in.
-4. A `ROS_DOMAIN_ID` no other car uses, or the page lists the other car's nodes as well.
-5. Check the camera device (`camera_device`), and that the VESC driver has the temperature patch, or the FET temperature shows "no reading" (see [Known gaps](#known-gaps)).
+3. The login user in the `input` group, or ROS cannot read the controller. Check with `id`: if `input` is listed, it's done (it is on #2 and #6). If not, `sudo usermod -aG input $USER`, then log out and back in.
+4. A `ROS_DOMAIN_ID` no other car uses, or the page lists the other car's nodes as well. Check with `echo $ROS_DOMAIN_ID`. The cars so far use 200 plus the robot's number, set in `~/.bashrc` (`export ROS_DOMAIN_ID=206` on #6, 202 on #2).
+5. The camera device. Bringup reads `/dev/video4` by default; check with `v4l2-ctl --list-devices`, and if the RealSense's colour stream is somewhere else, start bringup with `camera_device:=<device>`.
+6. The VESC driver's temperature patch, or the FET temperature shows "no reading" (see [Known gaps](#known-gaps)).
 
 ### Working on the page from a laptop
 

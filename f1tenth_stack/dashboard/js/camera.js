@@ -1,0 +1,339 @@
+"use strict";
+
+/* Camera stream and take-picture. */
+
+/* ==========================================================
+   CAMERA STREAM
+
+   A plain MJPEG stream over HTTP. The browser renders it in an
+   <img> all by itself, so there is no ROS image topic, no
+   rosbridge traffic and no library involved — just a URL.
+========================================================== */
+
+/* ==========================================================
+   AUTOMATIC CAMERA
+
+   The camera follows the robot: when rosbridge connects, the stream
+   is opened on that same robot (start_diagnostics.sh serves it on
+   :8082), so switching robots in the top bar switches the camera
+   too. While the robot is connected and the stream is not up yet
+   (camera still starting, or it dropped), it keeps retrying on its
+   own. Typing an address (or ?video=) switches this off until "Use
+   automatic" is pressed.
+========================================================== */
+
+const CAMERA_PORT = 8082;
+const CAMERA_PATH = "/camera.mjpg";
+const CAMERA_RETRY_MIN_MS = 3000;
+const CAMERA_RETRY_MAX_MS = 15000;
+
+let cameraManual = false;       // the user chose the address
+let cameraAuto = false;         // the current stream was picked for them
+let cameraUrlNow = "";
+let cameraRetryTimer = null;
+let cameraRetryMs = CAMERA_RETRY_MIN_MS;
+let cameraRobotDropped = false; // the robot went away since the stream opened
+
+/* ws://192.168.1.206:9090 -> http://192.168.1.206:8082/camera.mjpg */
+function cameraUrlFor(wsUrl) {
+
+  try {
+
+    const host = new URL(wsUrl).hostname;
+
+    return host ? `http://${host}:${CAMERA_PORT}${CAMERA_PATH}` : "";
+
+  } catch (error) {
+
+    return "";
+  }
+}
+
+function cameraLive() {
+  return !$("cameraImage").hidden && Boolean($("cameraImage").naturalWidth);
+}
+
+/* rosbridge just opened (connection.js) */
+function cameraOnRobotConnected(wsUrl) {
+
+  const dropped = cameraRobotDropped;
+
+  cameraRobotDropped = false;
+
+  if (cameraManual) {
+    /* their address, but the robot is back: try it again */
+    if (dropped || !cameraLive()) connectCamera(cameraUrlNow, false);
+    return;
+  }
+
+  const url = cameraUrlFor(wsUrl);
+
+  if (!url) return;
+
+  $("cameraUrl").value = url;
+
+  /* already showing this robot's camera, and nothing went away:
+     a Refresh should not blank the picture */
+  if (url === cameraUrlNow && cameraLive() && !dropped) {
+    renderCameraSource();
+    return;
+  }
+
+  connectCamera(url, true);
+}
+
+/* rosbridge closed (connection.js): stop retrying until it is back */
+function cameraOnRobotDisconnected() {
+
+  cameraRobotDropped = true;
+
+  clearTimeout(cameraRetryTimer);
+  cameraRetryTimer = null;
+}
+
+function useAutomaticCamera() {
+
+  cameraManual = false;
+
+  const url =
+    cameraUrlFor(socketOpen() ? ws.url : $("wsUrl").value.trim());
+
+  $("cameraUrl").value = url;
+  connectCamera(url, true);
+}
+
+function useManualCamera(url) {
+
+  cameraManual = true;
+  connectCamera(url, false);
+}
+
+/* the Reconnect buttons: same address, same mode */
+function reconnectCamera() {
+  connectCamera(cameraUrlNow || $("cameraUrl").value.trim(), cameraAuto);
+}
+
+function renderCameraSource() {
+
+  let where = cameraUrlNow;
+
+  try {
+    where = new URL(cameraUrlNow).host;
+  } catch (error) {}
+
+  $("cameraSource").textContent =
+    cameraAuto
+      ? `Automatic · follows the robot${where ? " (" + where + ")" : ""}`
+      : `Manual address${where ? " · " + where : ""}`;
+
+  $("cameraSource").classList.toggle("manual", !cameraAuto);
+  $("cameraAutoBtn").hidden = cameraAuto;
+}
+
+function setCameraStatus(text, color) {
+
+  $("camTag").textContent = text;
+  $("camTag").style.color = color;
+}
+
+/* ==========================================================
+   FRAME RATE
+
+   camera_http counts the frames it relays and reports them at /stats
+   on the same host and port as the stream. Read every 2 s while the
+   stream is showing; an older camera_http without /stats just leaves
+   this null.
+========================================================== */
+
+let cameraStats = null;
+
+async function pollCameraStats() {
+
+  const image = $("cameraImage");
+
+  if (image.hidden || !image.src) {
+    cameraStats = null;
+    return;
+  }
+
+  try {
+    const response = await fetch(new URL(image.src).origin + "/stats", { cache: "no-store" });
+    cameraStats = { ...(await response.json()), at: Date.now() };
+  } catch (error) {
+    cameraStats = null;
+    return;
+  }
+
+  const { fps, last_frame_s: age } = cameraStats;
+
+  if (age !== null && age > CAMERA_NO_FRAME_S) {
+    setCameraStatus("NO FRAMES", "var(--bad-ink)");
+  } else if (fps !== null) {
+    setCameraStatus(
+      `LIVE · ${Math.round(fps)} fps`,
+      fps < CAMERA_MIN_FPS ? "var(--warn-ink)" : "var(--healthy)");
+  }
+}
+
+setInterval(pollCameraStats, 2000);
+
+function connectCamera(url, auto = false) {
+
+  const image = $("cameraImage");
+
+  clearTimeout(cameraRetryTimer);
+  cameraRetryTimer = null;
+
+  if (url !== cameraUrlNow) cameraRetryMs = CAMERA_RETRY_MIN_MS;
+
+  cameraUrlNow = url;
+  cameraAuto = auto;
+  renderCameraSource();
+
+  if (!url) {
+
+    setCameraStatus("NO STREAM", "var(--bad-ink)");
+    $("camMessage").textContent =
+      auto ? "Waiting for the robot…" : "Enter a camera URL first.";
+    $("camMessage").hidden = false;
+    image.hidden = true;
+    return;
+  }
+
+  setCameraStatus("CONNECTING", "var(--muted)");
+
+  /* Without this, the browser loads the stream in "no-cors" mode
+     and treats it as opaque no matter what headers the server
+     sends — canvas draws from it are tainted regardless. With it,
+     the browser actually checks Access-Control-Allow-Origin, so
+     the server-side header above only takes effect once this is
+     set too. */
+  image.crossOrigin = "anonymous";
+
+  image.hidden = true;
+
+  $("camMessage").textContent = "Connecting…";
+  $("camMessage").hidden = false;
+
+  image.onload = () => {
+    image.hidden = false;
+    $("camMessage").hidden = true;
+    setCameraStatus("LIVE", "var(--healthy)");
+    cameraRetryMs = CAMERA_RETRY_MIN_MS;
+  };
+
+  image.onerror = () => {
+
+    image.hidden = true;
+    $("camMessage").hidden = false;
+
+    /* automatic, with the robot there: the camera may still be
+       starting, so keep trying, backing off */
+    if (auto && socketOpen()) {
+
+      const wait = cameraRetryMs;
+
+      cameraRetryMs = Math.min(cameraRetryMs * 2, CAMERA_RETRY_MAX_MS);
+
+      $("camMessage").textContent =
+        `No stream at ${url} yet — trying again in ${Math.round(wait / 1000)} s`;
+      setCameraStatus("RETRYING", "var(--warn-ink)");
+
+      cameraRetryTimer = setTimeout(() => {
+        if (cameraAuto && cameraUrlNow === url && socketOpen()) {
+          connectCamera(url, true);
+        }
+      }, wait);
+
+      return;
+    }
+
+    $("camMessage").textContent =
+      auto
+        ? `No stream at ${url} — it connects again when the robot does`
+        : "No stream at " + url;
+    setCameraStatus("NO STREAM", "var(--bad-ink)");
+  };
+
+  /* On a reconnect the browser may hand back its cached copy of
+     a failed request, so the retry would never leave the page.
+     A timestamp makes it a new URL. Skipped on the first connect
+     to keep the plain URL intact. */
+  image.src =
+    image.getAttribute("src")
+      ? url + (url.indexOf("?") < 0 ? "?" : "&") + "t=" + Date.now()
+      : url;
+}
+
+/* ==========================================================
+   TAKE PICTURE
+
+   Copies whatever frame is on screen into a canvas and turns it
+   into a PNG the browser can save. No library, no round trip to
+   the robot — the frame is already here.
+========================================================== */
+
+function showCameraHint(text) {
+
+  $("cameraHint").textContent = text;
+  $("cameraHint").hidden = !text;
+}
+
+function takePicture() {
+
+  const image = $("cameraImage");
+
+  if (image.hidden || !image.naturalWidth) {
+
+    showCameraHint(
+      "No live frame to capture — connect the camera first.");
+    return;
+  }
+
+  const canvas = document.createElement("canvas");
+
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+
+  canvas.getContext("2d").drawImage(image, 0, 0);
+
+  let data;
+
+  try {
+
+    data = canvas.toDataURL("image/png");
+
+  } catch (error) {
+
+    /* Drawing an image served by another origin "taints" the
+       canvas, and the browser then refuses to let the page read
+       the pixels back. The video keeps working — only the
+       capture is blocked. The fix is on the camera server:
+       send an Access-Control-Allow-Origin header. */
+    showCameraHint(
+      "The browser blocked reading this frame. The camera server " +
+      "does not send an Access-Control-Allow-Origin header, so the " +
+      "page can show the video but cannot copy its pixels. The " +
+      "stream itself is fine.");
+    return;
+  }
+
+  const stamp = new Date();
+
+  $("snapshotImage").src = data;
+  $("snapshotSave").href = data;
+
+  $("snapshotSave").download =
+    "camera-" +
+    stamp.toISOString().slice(0, 19).replace(/[:T]/g, "-") +
+    ".png";
+
+  $("snapshotTime").textContent =
+    canvas.width + "×" + canvas.height + " · " +
+    stamp.toLocaleTimeString();
+
+  $("snapshot").hidden = false;
+
+  showCameraHint("");
+}
+
